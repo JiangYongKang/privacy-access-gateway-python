@@ -1,8 +1,5 @@
-from fastapi import FastAPI
+"""本地运行入口：uv run uvicorn main:app。"""
 
-app = FastAPI()
+from privacy_gateway.app import create_app
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+app = create_app()
