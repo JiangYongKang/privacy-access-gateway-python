@@ -1,5 +1,6 @@
 """本地数据访问网关：访问判定、字段脱敏与审计留痕。"""
 
+from gateway.decision_log import DecisionLogEntry, Outcome
 from gateway.errors import (
     AccessDeniedError,
     AuditError,
@@ -12,6 +13,7 @@ from gateway.models import (
     Decision,
     DecisionResult,
     Purpose,
+    ReasonCode,
     ResourceRecord,
     Subject,
 )
@@ -23,11 +25,14 @@ __all__ = [
     "AccessView",
     "AuditError",
     "Decision",
+    "DecisionLogEntry",
     "DecisionResult",
     "GatewayError",
     "MaskingError",
+    "Outcome",
     "PolicyError",
     "Purpose",
+    "ReasonCode",
     "ResourceRecord",
     "Subject",
 ]

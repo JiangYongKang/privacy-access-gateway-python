@@ -28,6 +28,19 @@ def _tokenize(field: str, value: str, key: bytes) -> str:
     return f"tok_{digest[:24]}"
 
 
+def audit_reference_handle(record_id: str, policy_version: int, key: bytes) -> str:
+    """超期记录的审计引用句柄：不含任何个人字段，确定可复现。
+
+    同一记录在同一策略版本下句柄稳定；策略版本变化后句柄随之改变，
+    新旧句柄可区分。句柄为 HMAC 摘要，无法反推记录内容。
+    """
+    if not key:
+        raise MaskingError("token-key-missing")
+    msg = f"audit-ref|{record_id}|v{policy_version}".encode()
+    digest = hmac.new(key, msg, hashlib.sha256).hexdigest()
+    return f"ref_{digest[:24]}"
+
+
 def apply_view(fields: dict[str, str], rule: ViewRule, token_key: bytes) -> dict[str, str]:
     """按视图规则输出字段集合：明文 / 掩码 / 令牌化。
 

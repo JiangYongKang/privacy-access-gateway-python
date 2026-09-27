@@ -6,11 +6,17 @@ class GatewayError(Exception):
 
 
 class AccessDeniedError(GatewayError):
-    """访问被拒绝，携带可区分的拒绝原因。"""
+    """访问被拒绝，携带可区分的拒绝原因。
 
-    def __init__(self, reason: str) -> None:
-        super().__init__(reason)
-        self.reason = reason
+    ``reasons`` 为全部不满足维度的原子原因（``<code>:<detail>``），
+    ``reason`` 为分号连接的汇总字符串，保持原有归类方式不变。
+    """
+
+    def __init__(self, reason: str | tuple[str, ...] | list[str]) -> None:
+        reasons = (reason,) if isinstance(reason, str) else tuple(reason)
+        self.reasons: tuple[str, ...] = reasons
+        self.reason: str = ";".join(reasons)
+        super().__init__(self.reason)
 
 
 class MaskingError(GatewayError):

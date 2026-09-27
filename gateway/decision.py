@@ -4,8 +4,19 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from gateway.models import Decision, DecisionResult, Purpose, ResourceRecord, Subject
+from gateway.models import (
+    Decision,
+    DecisionResult,
+    Purpose,
+    ReasonCode,
+    ResourceRecord,
+    Subject,
+)
 from gateway.policy import Policy
+
+
+def _as_utc(dt: datetime) -> datetime:
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
 
 
 def evaluate(
@@ -17,67 +28,93 @@ def evaluate(
 ) -> DecisionResult:
     """对一次访问请求求值，返回结论与依据。
 
-    判定顺序固定，任一必要依据缺失即拒绝并给出可区分原因：
-    1. 保留期检查（过期数据不可访问，仅可被 AUDIT_REVIEW 用途审计引用）；
-    2. (角色, 用途, 敏感级别) 授权检查；
-    3. 视图存在性与主体必要属性检查。
-    """
-    reasons: list[str] = []
+    按维度逐一求值并**聚合全部不满足的依据**（而非只暴露第一个），
+    维度顺序固定，原因以稳定原子码为前缀（见 ReasonCode）：
 
-    # 1. 保留期检查
+    1. 保留期：无规则或超期（超期仅 AUDIT_REVIEW 可审计引用，其余用途拒绝）；
+    2. 授权：(角色, 用途, 敏感级别) 是否存在匹配授权；
+    3. 视图：授权指向的视图是否已定义；
+    4. 属性：主体是否具备视图要求的全部必要属性；
+       授权缺失时，改按同 (角色, 用途) 下其他敏感级别授权的候选视图检查，
+       使“无授权 + 缺属性”两类依据可同时暴露。
+    """
+    deny_reasons: list[str] = []
+    info_reasons: list[str] = []
+    audit_reference_only = False
+
+    # 1. 保留期维度
     retention = policy.retention_days.get(resource.sensitivity)
     if retention is None:
-        return DecisionResult(
-            decision=Decision.DENY,
-            reasons=(f"no-retention-rule:{resource.sensitivity}",),
-            policy_version=policy.version,
-        )
-    def _as_utc(dt: datetime) -> datetime:
-        return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+        deny_reasons.append(f"{ReasonCode.NO_RETENTION_RULE.value}:{resource.sensitivity}")
+    else:
+        age_days = (_as_utc(now) - _as_utc(resource.created_at)).days
+        if age_days > retention:
+            if purpose is Purpose.AUDIT_REVIEW:
+                info_reasons.append(
+                    f"{ReasonCode.RETENTION_EXPIRED.value}:"
+                    f"audit-reference-only(age={age_days}d)"
+                )
+                audit_reference_only = True
+            else:
+                deny_reasons.append(
+                    f"{ReasonCode.RETENTION_EXPIRED.value}:{age_days}d>{retention}d"
+                )
 
-    age_days = (_as_utc(now) - _as_utc(resource.created_at)).days
-    if age_days > retention:
-        if purpose is Purpose.AUDIT_REVIEW:
-            reasons.append(f"retention-expired:audit-reference-only(age={age_days}d)")
-        else:
-            return DecisionResult(
-                decision=Decision.DENY,
-                reasons=(f"retention-expired:{age_days}d>{retention}d",),
-                policy_version=policy.version,
-            )
-
-    # 2. 授权检查
+    # 2. 授权维度
     key = (subject.role, purpose.value, resource.sensitivity)
     view_name = policy.grants.get(key)
     if view_name is None:
+        deny_reasons.append(
+            f"{ReasonCode.NO_GRANT.value}:role={subject.role},"
+            f"purpose={purpose.value},sensitivity={resource.sensitivity}"
+        )
+
+    # 3+4. 视图与属性维度
+    if view_name is not None:
+        view = policy.views.get(view_name)
+        if view is None:
+            deny_reasons.append(f"{ReasonCode.VIEW_UNDEFINED.value}:{view_name}")
+        else:
+            missing = sorted(
+                policy.required_attributes.get(view_name, frozenset())
+                - subject.attributes
+            )
+            if missing:
+                deny_reasons.append(
+                    f"{ReasonCode.MISSING_ATTRIBUTES.value}:{','.join(missing)}"
+                )
+    else:
+        # 授权缺失时仍聚合属性维度：取同 (角色, 用途) 候选视图的必要属性
+        candidate_views = {
+            v for (r, p, _s), v in policy.grants.items()
+            if r == subject.role and p == purpose.value
+        }
+        candidate_required: set[str] = set()
+        for name in candidate_views:
+            candidate_required |= set(
+                policy.required_attributes.get(name, frozenset())
+            )
+        missing = sorted(candidate_required - set(subject.attributes))
+        if missing:
+            deny_reasons.append(
+                f"{ReasonCode.MISSING_ATTRIBUTES.value}:{','.join(missing)}"
+            )
+
+    if deny_reasons:
         return DecisionResult(
             decision=Decision.DENY,
-            reasons=(f"no-grant:role={subject.role},purpose={purpose.value},"
-                     f"sensitivity={resource.sensitivity}",),
+            reasons=tuple(deny_reasons),
             policy_version=policy.version,
         )
 
-    # 3. 视图与属性检查
-    view = policy.views.get(view_name)
-    if view is None:
-        return DecisionResult(
-            decision=Decision.DENY,
-            reasons=(f"view-undefined:{view_name}",),
-            policy_version=policy.version,
-        )
-    required = policy.required_attributes.get(view_name, frozenset())
-    missing = sorted(required - subject.attributes)
-    if missing:
-        return DecisionResult(
-            decision=Decision.DENY,
-            reasons=(f"missing-attributes:{','.join(missing)}",),
-            policy_version=policy.version,
-        )
-
-    reasons.append(f"grant:{key[0]}/{key[1]}/{key[2]}->view={view_name}")
+    assert view_name is not None  # 无拒绝依据时授权必然存在
+    info_reasons.append(
+        f"{ReasonCode.GRANT.value}:{key[0]}/{key[1]}/{key[2]}->view={view_name}"
+    )
     return DecisionResult(
         decision=Decision.ALLOW,
-        reasons=tuple(reasons),
+        reasons=tuple(info_reasons),
         policy_version=policy.version,
         view=view_name,
+        audit_reference_only=audit_reference_only,
     )

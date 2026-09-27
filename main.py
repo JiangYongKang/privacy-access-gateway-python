@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException, Query
 
 from gateway.errors import AccessDeniedError, AuditError, MaskingError
 from gateway.audit import InMemoryAuditSink
+from gateway.decision_log import InMemoryDecisionLogSink
 from gateway.models import Purpose, ResourceRecord, Subject
 from gateway.policy import Policy, PolicyStore, ViewRule
 from gateway.service import AccessGateway
@@ -46,7 +47,9 @@ POLICY = Policy(
 
 STORE = PolicyStore(POLICY)
 SINK = InMemoryAuditSink()
-GATEWAY = AccessGateway(STORE, SINK, token_key=b"local-demo-key")
+DECISION_LOG = InMemoryDecisionLogSink()
+GATEWAY = AccessGateway(STORE, SINK, token_key=b"local-demo-key",
+                        decision_log=DECISION_LOG)
 
 RECORDS: dict[str, ResourceRecord] = {
     "r1": ResourceRecord(
@@ -80,7 +83,8 @@ def read_record(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except MaskingError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return {"record": {"record_id": view.record_id, "view": view.view, "fields": view.fields}}
+    return {"record": {"record_id": view.record_id, "view": view.view,
+                       "fields": view.fields, "reference": view.reference}}
 
 
 @app.get("/audit")
@@ -97,4 +101,23 @@ def list_audit():
             "policy_version": r.policy_version,
         }
         for r in SINK.records()
+    ]
+
+
+@app.get("/decisions")
+def list_decisions():
+    """运行期决策日志：每次判定恰好一条，覆盖全部结局。"""
+    return [
+        {
+            "timestamp": e.timestamp.isoformat(),
+            "subject_id": e.subject_id,
+            "role": e.role,
+            "resource_id": e.resource_id,
+            "purpose": e.purpose,
+            "outcome": e.outcome,
+            "decision": e.decision,
+            "reasons": list(e.reasons),
+            "policy_version": e.policy_version,
+        }
+        for e in DECISION_LOG.entries()
     ]
