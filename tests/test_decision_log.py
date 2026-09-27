@@ -7,7 +7,14 @@ from dataclasses import replace
 
 import pytest
 
-from gateway import AccessDeniedError, AccessGateway, AuditError, MaskingError, Purpose, Subject
+from gateway import (
+    AccessDeniedError,
+    AccessGateway,
+    AuditError,
+    MaskingError,
+    Purpose,
+    Subject,
+)
 from gateway.audit import InMemoryAuditSink
 from gateway.decision_log import LOGGER_NAME
 from gateway.policy import ViewRule
@@ -41,6 +48,8 @@ def test_allow_emits_one_structured_log(store, record, agent, now, caplog_decisi
     gw.access(agent, record, Purpose.SERVICE, now)
     (entry,) = payloads(caplog_decision)
     assert entry["outcome"] == "allow"
+    assert entry["decision"] == "allow"
+    assert entry["delivered"] == "primary"
     assert entry["subject_id"] == "s1" and entry["role"] == "agent"
     assert entry["resource_id"] == "r1" and entry["purpose"] == "service"
     assert entry["policy_version"] == 1 and entry["view"] == "service_view"
@@ -53,19 +62,40 @@ def test_deny_emits_log_with_reasons(store, record, now, caplog_decision):
         gw.access(Subject("s9", "intruder"), record, Purpose.SERVICE, now)
     (entry,) = payloads(caplog_decision)
     assert entry["outcome"] == "deny"
+    assert entry["decision"] == "deny"
     assert any(r.startswith("no-grant") for r in entry["reasons"])
 
 
 def test_audit_failure_emits_log(store, record, agent, now, caplog_decision):
     class FailingSink:
         def write(self, record):
-            raise IOError("disk full")
+            raise OSError("disk full")
 
     gw = AccessGateway(store, FailingSink(), b"test-key")
     with pytest.raises(AuditError):
         gw.access(agent, record, Purpose.SERVICE, now)
     (entry,) = payloads(caplog_decision)
     assert entry["outcome"] == "audit_error"
+    # 审计写入失败的是一个本应放行的请求：底层判定结论仍须可机读为 allow
+    assert entry["decision"] == "allow"
+
+
+def test_audit_failure_on_denied_request_keeps_deny_decision(
+    store, record, now, caplog_decision
+):
+    """审计失败请求本身是拒绝结局时：失败归类不变，底层判定仍可读为 deny。"""
+
+    class FailingSink:
+        def write(self, record):
+            raise OSError("disk full")
+
+    gw = AccessGateway(store, FailingSink(), b"test-key")
+    with pytest.raises(AuditError):
+        gw.access(Subject("s9", "intruder"), record, Purpose.SERVICE, now)
+    (entry,) = payloads(caplog_decision)
+    assert entry["outcome"] == "audit_error"
+    assert entry["decision"] == "deny"
+    assert any(r.startswith("no-grant") for r in entry["reasons"])
 
 
 def test_masking_failure_emits_log(store, policy, record, agent, now, caplog_decision):
@@ -76,6 +106,8 @@ def test_masking_failure_emits_log(store, policy, record, agent, now, caplog_dec
         gw.access(agent, record, Purpose.SERVICE, now)
     (entry,) = payloads(caplog_decision)
     assert entry["outcome"] == "masking_error"
+    # 脱敏失败发生在已判定放行之后：底层判定结论仍须可机读为 allow
+    assert entry["decision"] == "allow"
 
 
 def test_logs_contain_no_raw_sensitive_values(store, record, agent, now, caplog_decision):

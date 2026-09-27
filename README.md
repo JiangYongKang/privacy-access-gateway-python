@@ -13,7 +13,7 @@ gateway/
   masking.py      字段级脱敏与确定性令牌化
   reference.py    超期记录的仅审计引用句柄（HMAC 派生，可复现）
   audit.py        审计记录与线程安全的内存审计存储
-  decision_log.py 运行期决策日志（结构化、线程安全、每次判定恰好一条）
+  decision_log.py 运行期决策日志（结构化、线程安全、每次判定恰好一条、输出端故障自动兜底）
   service.py      AccessGateway 编排：取快照 → 判定 → 审计 → 脱敏/引用 → 决策日志
 main.py           FastAPI 演示服务（查询记录 / 查看审计）
 tests/            pytest 测试
@@ -55,22 +55,70 @@ tests/            pytest 测试
 
 | 字段 | 含义 |
 |---|---|
+| `log_id` | 每条日志唯一 ID（hex），用于确认不丢不重 |
 | `timestamp` | 判定时间（ISO 格式） |
 | `subject_id` / `role` | 主体标识与角色 |
 | `resource_id` | 资源标识 |
 | `purpose` | 访问用途 |
-| `outcome` | 结局：`allow` / `deny` / `audit_error` / `masking_error` |
+| `decision` | **本次判定本身的结论**：`allow` / `deny`（与结局分类相互独立） |
+| `outcome` | 请求最终结局：`allow` / `deny` / `audit_error` / `masking_error` |
+| `delivered` | 投递路径：`primary`（主输出端）/ `fallback`（主端故障后兜底） |
+| `primary_error` | 主输出端故障时的静态机读标记 `decision-log-sink-failed`（否则无此字段） |
 | `policy_version` | 判定所用策略版本 |
 | `reasons` | 逐条原子原因（放行时为授权命中等依据） |
 | `view` | 放行时使用的视图名（否则为 null） |
 | `reference` | 超期仅审计引用时的句柄（否则为 null） |
 
+### 如何读取判定结论
+
+`decision` 与 `outcome` 是两个正交字段：
+
+- `decision` 回答“**判定引擎本身给的是放行还是拒绝**”，任何结局下都可机读；
+- `outcome` 回答“**请求最终以什么结局结束**”。
+
+典型组合：
+
+| outcome | decision | 含义 |
+|---|---|---|
+| `allow` | `allow` | 正常放行并返回脱敏视图 |
+| `deny` | `deny` | 判定拒绝，返回可识别拒绝原因 |
+| `audit_error` | `allow` 或 `deny` | 审计写入失败；底层判定结论仍可读出 |
+| `masking_error` | `allow` | 已判定放行但脱敏阶段失败 |
+
+注意审计失败发生在判定之后，因此其 `decision` 取决于本次请求本应放行还是拒绝；
+不应仅凭 `outcome` 推断底层结论。`reasons` 与 `policy_version` 在所有结局下都保留，
+失败结局也能完整追溯判定依据。
+
+### 日志输出端故障时的行为
+
+`DecisionLogger` 采用“主输出端 + 安全兜底端”结构（均可注入）：
+
+- 默认主输出端 `LoggingDecisionSink` 走标准 `logging`（logger 名
+  `gateway.decision`，INFO，消息 `access_decision <json>`，字段同时以
+  `dl_<字段>` 挂在 `LogRecord` 上）；
+- 主端**抛任何异常**都被隔离：该条日志改由 `SafeStreamFallbackSink`
+  （默认带锁写入 stderr，文本为 `access_decision_fallback <json>`）输出，
+  负载标记 `delivered=fallback` 与 `primary_error=decision-log-sink-failed`；
+- 故障标记是**静态字符串**，绝不拼接异常对象文本；异常信息即使夹带敏感值
+  也不会进入日志或对外错误；
+- **不丢不重**：主端成功只走主端、主端失败只走兜底端，同一条日志不会两端
+  各写一次；兜底端用锁保证并发下各条不穿插；
+- **不带偏结论**：日志链路（含兜底端自身再失败）在任何路径下都不向调用方
+  抛错——本应放行的仍返回脱敏视图，本应拒绝的仍抛同一个
+  `AccessDeniedError`，审计失败仍是 `AuditError`，脱敏失败仍是
+  `MaskingError`，失败归类与错误文本均与无日志故障时完全一致。
+
 语义保证：
 
 - **恰好一条**：放行、拒绝、审计写入失败、脱敏失败四条路径各发射且仅发射一条；
-- **线程安全**：基于标准 `logging`，并发访问不丢不重；
-- **不改变结论**：日志发射在判定之后，记日志本身不影响放行/拒绝结果；
-- **不泄漏**：日志只含标识与依据，姓名、证件号、手机号等原始敏感值一律不出现。
+  每条带唯一 `log_id`，可用于核对不丢不重；
+- **线程安全**：主端依赖标准 `logging` 自身的线程安全，兜底端加锁串行写入，
+  并发访问不丢不重、不互相穿插；
+- **不改变结论**：日志发射在判定之后，日志输出端故障被完全隔离，
+  对外返回值、异常类型与错误文本都与无故障时一致；
+- **结论可机读**：任何结局下 `decision` 都独立给出底层放行/拒绝结论；
+- **不泄漏**：日志只含标识与依据，姓名、证件号、手机号等原始敏感值一律不出现；
+  输出端异常文本也不会被拼接进日志或错误信息。
 
 ## 脱敏规则
 
@@ -118,9 +166,32 @@ tests/            pytest 测试
 
 ```bash
 uv sync                 # 安装依赖
-uv run pytest tests/ -q # 运行测试（越权 / 保留期边界 / 并发更新 / 异常链路 /
-                        # 决策日志 / 超期仅审计引用 / 拒绝原因聚合）
+uv run pytest tests/ -q # 全部用例（越权 / 保留期边界 / 并发更新 / 异常链路 /
+                        # 决策日志 / 日志端故障隔离 / 超期仅审计引用 / 拒绝原因聚合）
+# 只看日志端故障隔离与并发不丢不重：
+uv run pytest tests/test_decision_log_resilience.py -v
 uv run uvicorn main:app --reload   # 启动演示服务
+```
+
+本地模拟日志输出端故障（验证请求结论不被带偏、日志走兜底）：
+
+```python
+from gateway import AccessGateway, DecisionLogger, SafeStreamFallbackSink
+
+class FailingLogSink:
+    def write(self, payload):
+        raise RuntimeError("log backend down")
+
+# 主端必失败 → 每条日志自动降级到 stderr 上的结构化兜底输出，
+# access() 的返回值/异常类型与正常时完全一致
+gw = AccessGateway(
+    store, audit_sink, b"key",
+    decision_logger=DecisionLogger(FailingLogSink(), SafeStreamFallbackSink()),
+)
+view = gw.access(agent, record, Purpose.SERVICE)  # 仍正常返回脱敏视图
+# stderr: access_decision_fallback {"log_id": ..., "decision": "allow",
+#          "outcome": "allow", "delivered": "fallback",
+#          "primary_error": "decision-log-sink-failed", ...}
 ```
 
 演示请求：
@@ -143,5 +214,6 @@ def test_decision_log(caplog):
     with caplog.at_level("INFO", logger="gateway.decision"):
         ...  # 触发访问
     entry = json.loads(caplog.records[-1].getMessage().split(" ", 1)[1])
-    assert entry["outcome"] == "allow" and entry["policy_version"] == 1
+    assert entry["outcome"] == "allow" and entry["decision"] == "allow"
+    assert entry["delivered"] == "primary" and entry["policy_version"] == 1
 ```

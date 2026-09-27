@@ -12,7 +12,7 @@ from gateway.policy import ViewRule
 
 class FailingSink:
     def write(self, record):
-        raise IOError("disk full")
+        raise OSError("disk full")
 
 
 def test_audit_failure_blocks_access(store, record, agent, now):

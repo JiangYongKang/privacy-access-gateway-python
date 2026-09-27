@@ -51,21 +51,29 @@ class AccessGateway:
         outcome: str,
         reference: str | None = None,
     ) -> None:
-        """发射一条决策日志。只含标识与依据，绝不含原始敏感值。"""
-        self._log.emit(
-            DecisionLogEntry(
-                timestamp=now,
-                subject_id=subject.subject_id,
-                role=subject.role,
-                resource_id=resource.record_id,
-                purpose=purpose.value,
-                outcome=outcome,
-                policy_version=result.policy_version,
-                reasons=result.reasons,
-                view=result.view,
-                reference=reference,
+        """发射一条决策日志。只含标识与依据，绝不含原始敏感值。
+
+        日志发射（含输出端故障）在任何路径下都不得向调用方抛错，
+        以免带偏本次请求既有的放行/拒绝/失败归类结论。
+        """
+        try:
+            self._log.emit(
+                DecisionLogEntry(
+                    timestamp=now,
+                    subject_id=subject.subject_id,
+                    role=subject.role,
+                    resource_id=resource.record_id,
+                    purpose=purpose.value,
+                    outcome=outcome,
+                    policy_version=result.policy_version,
+                    decision=result.decision.value,
+                    reasons=result.reasons,
+                    view=result.view,
+                    reference=reference,
+                )
             )
-        )
+        except Exception:  # noqa: BLE001, S110
+            pass  # 双保险：日志故障永不影响结论
 
     def access(
         self,
@@ -82,7 +90,7 @@ class AccessGateway:
         record = build_record(subject, resource.record_id, purpose, result, now)
         try:
             self._sink.write(record)
-        except Exception as exc:  # noqa: BLE001 - 归一化为可区分错误
+        except Exception as exc:
             self._emit(subject, resource, purpose, result, now, OUTCOME_AUDIT_ERROR)
             raise AuditError(f"audit-write-failed:{type(exc).__name__}") from exc
 

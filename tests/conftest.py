@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from gateway.models import Purpose, ResourceRecord, Subject
+from gateway.models import ResourceRecord, Subject
 from gateway.policy import Policy, PolicyStore, ViewRule
 
 NOW = datetime(2026, 9, 21, tzinfo=UTC)

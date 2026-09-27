@@ -1,10 +1,10 @@
 """审计留痕内容与敏感值泄漏检查。"""
 
+import pytest
+
 from gateway import AccessGateway, Purpose, Subject
 from gateway.audit import InMemoryAuditSink
 from gateway.errors import AccessDeniedError
-
-import pytest
 
 SECRETS = ("张三", "13800001234", "330102199001011234")
 

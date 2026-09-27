@@ -1,12 +1,10 @@
 """越权访问与判定一致性。"""
 
-from datetime import datetime
 
 import pytest
 
 from gateway import AccessDeniedError, AccessGateway, Purpose, Subject
 from gateway.audit import InMemoryAuditSink
-from gateway.models import ResourceRecord
 
 
 def make_gw(store):
