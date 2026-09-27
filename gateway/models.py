@@ -50,12 +50,17 @@ class DecisionResult:
     reasons: tuple[str, ...]
     policy_version: int
     view: str | None = None  # 允许时使用的权限视图名
+    audit_reference_only: bool = False  # 超期记录：仅允许审计引用，不输出任何字段
 
 
 @dataclass(frozen=True)
 class AccessView:
-    """脱敏后的输出视图。"""
+    """脱敏后的输出视图。
+
+    超期记录的审计引用场景下 fields 为空，仅携带可复现的 reference 句柄。
+    """
 
     record_id: str
     view: str
     fields: dict[str, str] = field(default_factory=dict)
+    reference: str | None = None  # 仅审计引用句柄（超期记录场景）

@@ -80,7 +80,14 @@ def read_record(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except MaskingError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return {"record": {"record_id": view.record_id, "view": view.view, "fields": view.fields}}
+    return {
+        "record": {
+            "record_id": view.record_id,
+            "view": view.view,
+            "fields": view.fields,
+            "reference": view.reference,  # 超期仅审计引用时为句柄，否则为 null
+        }
+    }
 
 
 @app.get("/audit")

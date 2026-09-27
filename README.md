@@ -1,37 +1,76 @@
 # privacy-access-gateway
 
-本地数据访问网关：对含个人敏感信息的记录进行**访问判定、字段脱敏与审计留痕**，
-使不同角色、用途与数据范围下的结论一致、可解释且可复现。
+本地数据访问网关：对含个人敏感信息的记录进行**访问判定、字段脱敏、审计留痕与
+运行期决策日志**，使不同角色、用途与数据范围下的结论一致、可解释且可复现。
 
 ## 架构
 
 ```
 gateway/
-  models.py    主体 / 资源 / 用途 / 判定结果等不可变数据模型
-  policy.py    策略定义（Policy）与线程安全的版本化策略存储（PolicyStore）
-  decision.py  纯函数判定引擎 evaluate()
-  masking.py   字段级脱敏与确定性令牌化
-  audit.py     审计记录与线程安全的内存审计存储
-  service.py   AccessGateway 编排：取快照 → 判定 → 审计 → 脱敏输出
-main.py        FastAPI 演示服务（查询记录 / 查看审计）
-tests/         pytest 测试
+  models.py       主体 / 资源 / 用途 / 判定结果等不可变数据模型
+  policy.py       策略定义（Policy）与线程安全的版本化策略存储（PolicyStore）
+  decision.py     纯函数判定引擎 evaluate()（多维度拒绝原因聚合）
+  masking.py      字段级脱敏与确定性令牌化
+  reference.py    超期记录的仅审计引用句柄（HMAC 派生，可复现）
+  audit.py        审计记录与线程安全的内存审计存储
+  decision_log.py 运行期决策日志（结构化、线程安全、每次判定恰好一条）
+  service.py      AccessGateway 编排：取快照 → 判定 → 审计 → 脱敏/引用 → 决策日志
+main.py           FastAPI 演示服务（查询记录 / 查看审计）
+tests/            pytest 测试
 ```
 
-## 判定模型
+## 判定模型与拒绝原因聚合
 
 一次访问由四元组决定：**主体（角色 + 属性）× 用途 × 资源敏感级别 × 策略快照**。
-判定按固定顺序求值，任一必要依据缺失即拒绝，且原因可区分：
+判定按固定维度顺序求值，**所有可独立求值的不满足维度一次性聚合列出**，
+而非只暴露第一个，便于调用方一次改到位。每个维度用稳定、彼此可区分的
+原子原因标识表达：
 
-| 顺序 | 检查 | 拒绝原因前缀 |
+| 顺序 | 维度 | 原子原因前缀 |
 |---|---|---|
 | 1 | 敏感级别存在保留期规则 | `no-retention-rule:` |
 | 2 | 记录未超保留期（超期仅 `audit_review` 可审计引用） | `retention-expired:` |
 | 3 | `(role, purpose, sensitivity)` 存在授权 | `no-grant:` |
 | 4 | 授权指向的视图已定义 | `view-undefined:` |
-| 5 | 主体具备视图要求的全部属性 | `missing-attributes:` |
+| 5 | 主体具备视图要求的必要属性 | `missing-attributes:` |
+
+分级方式：维度 1–2 为**数据可留存性**，维度 3 为**授权**，维度 4–5 为
+**视图与主体属性**。属性维度在视图名可确定时即可求值；授权缺失时退而检查同一
+`(角色, 用途)` 下其他敏感级别授权所指向视图的必要属性，因此
+`no-grant:` 与 `missing-attributes:` 可同时出现。多个缺失属性按字典序聚合在
+同一条 `missing-attributes:a,b` 内。拒绝时 `AccessDeniedError.reason` 为全部
+原子原因以 `;` 连接，顺序固定、可复现。
 
 判定引擎是纯函数：相同输入（含策略快照与时间）必然得到相同结论，结论中携带
 `policy_version` 与 `reasons`，可解释、可复现。
+
+## 运行期决策日志
+
+每一次访问判定（无论结局）都恰好发射**一条**结构化运行日志，logger 名为
+`gateway.decision`，级别 INFO，消息为 `access_decision <json>`；JSON 负载
+同时以 `dl_<字段>` 形式挂在 `LogRecord` 上，便于本地用日志捕获（如 pytest
+`caplog`）按关键字段断言。
+
+字段（均为可机读的判定依据，**绝不含任何原始敏感值**）：
+
+| 字段 | 含义 |
+|---|---|
+| `timestamp` | 判定时间（ISO 格式） |
+| `subject_id` / `role` | 主体标识与角色 |
+| `resource_id` | 资源标识 |
+| `purpose` | 访问用途 |
+| `outcome` | 结局：`allow` / `deny` / `audit_error` / `masking_error` |
+| `policy_version` | 判定所用策略版本 |
+| `reasons` | 逐条原子原因（放行时为授权命中等依据） |
+| `view` | 放行时使用的视图名（否则为 null） |
+| `reference` | 超期仅审计引用时的句柄（否则为 null） |
+
+语义保证：
+
+- **恰好一条**：放行、拒绝、审计写入失败、脱敏失败四条路径各发射且仅发射一条；
+- **线程安全**：基于标准 `logging`，并发访问不丢不重；
+- **不改变结论**：日志发射在判定之后，记日志本身不影响放行/拒绝结果；
+- **不泄漏**：日志只含标识与依据，姓名、证件号、手机号等原始敏感值一律不出现。
 
 ## 脱敏规则
 
@@ -43,12 +82,20 @@ tests/         pytest 测试
 
 未在视图中声明的字段**一律不输出**；越权字段不会出现在响应、错误信息或日志中。
 
-## 保留期策略
+## 保留期策略与超期仅审计引用
 
 `retention_days` 按敏感级别配置保留天数。记录年龄 ≤ 保留期可正常访问；
-超过保留期后：普通用途一律拒绝（`retention-expired:`），仅 `audit_review`
-用途可按审计视图引用。策略更新整体替换并递增 `version`，历史审计记录中的
-结论与 `policy_version` 不会被改写，新旧结论可区分、可复现。
+超过保留期后：
+
+- **普通用途一律拒绝**（`retention-expired:`），既有保留期边界结论不变；
+- **仅 `audit_review` 用途可审计引用**：返回结果中**不含任何个人字段**
+  （明文、掩码、令牌化均不输出，`fields` 为空），只携带一个可复现的
+  **引用句柄** `reference`（`ref_<hex>`）。
+
+句柄由 `(记录标识, 策略版本)` 经 HMAC-SHA256 派生：同一记录在同一策略版本下
+稳定可复现；策略版本变化后新旧句柄可区分；句柄不含、也不可反推任何原始
+敏感字段值。策略更新整体替换并递增 `version`，历史审计记录中的结论与
+`policy_version` 不会被改写，新旧结论可区分、可复现。
 
 ## 并发与失败语义
 
@@ -59,11 +106,20 @@ tests/         pytest 测试
   `AuditError`（审计失败）、`PolicyError`（策略非法），均为 `GatewayError` 子类。
 - 所有状态对象不可变，任何失败不污染既有策略、不残留部分状态。
 
+## 兼容范围
+
+- 既有行为不变：保留期边界（年龄 ≤ 保留期放行）、未超期记录的脱敏输出、
+  审计先于放行、错误归类方式、判定可复现性均保持原语义；
+- 单一维度不满足时拒绝原因仍为原来的一条，不引入额外原因；
+- 新增能力均为向后兼容扩展：`DecisionResult.audit_reference_only`、
+  `AccessView.reference` 有默认值；决策日志为新增输出，不改变既有返回值与异常。
+
 ## 本地验证
 
 ```bash
 uv sync                 # 安装依赖
-uv run pytest tests/ -q # 运行测试（越权 / 保留期边界 / 并发更新 / 异常链路）
+uv run pytest tests/ -q # 运行测试（越权 / 保留期边界 / 并发更新 / 异常链路 /
+                        # 决策日志 / 超期仅审计引用 / 拒绝原因聚合）
 uv run uvicorn main:app --reload   # 启动演示服务
 ```
 
@@ -74,8 +130,18 @@ uv run uvicorn main:app --reload   # 启动演示服务
 curl 'http://127.0.0.1:8000/records/r1?subject_id=s1&role=agent&purpose=service&attrs=dept:cs'
 # 缺少必要属性 → 403 missing-attributes:dept:cs
 curl 'http://127.0.0.1:8000/records/r1?subject_id=s1&role=agent&purpose=service'
-# 超保留期记录仅审计用途可引用
+# 超保留期记录仅审计用途可引用：fields 为空，仅返回可复现 reference 句柄
 curl 'http://127.0.0.1:8000/records/r2?subject_id=s9&role=auditor&purpose=audit_review'
 # 查看审计留痕（含判定依据，不含原始敏感值）
 curl 'http://127.0.0.1:8000/audit'
+```
+
+本地捕获决策日志做断言（pytest）：
+
+```python
+def test_decision_log(caplog):
+    with caplog.at_level("INFO", logger="gateway.decision"):
+        ...  # 触发访问
+    entry = json.loads(caplog.records[-1].getMessage().split(" ", 1)[1])
+    assert entry["outcome"] == "allow" and entry["policy_version"] == 1
 ```
