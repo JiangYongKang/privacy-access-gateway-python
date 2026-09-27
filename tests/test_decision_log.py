@@ -41,6 +41,8 @@ def test_allow_emits_one_structured_log(store, record, agent, now, caplog_decisi
     gw.access(agent, record, Purpose.SERVICE, now)
     (entry,) = payloads(caplog_decision)
     assert entry["outcome"] == "allow"
+    assert entry["decision"] == "allow"  # 判定本身结论独立可机读
+    assert entry["log_id"]  # 每条日志带可辨认的唯一标识
     assert entry["subject_id"] == "s1" and entry["role"] == "agent"
     assert entry["resource_id"] == "r1" and entry["purpose"] == "service"
     assert entry["policy_version"] == 1 and entry["view"] == "service_view"
@@ -53,6 +55,7 @@ def test_deny_emits_log_with_reasons(store, record, now, caplog_decision):
         gw.access(Subject("s9", "intruder"), record, Purpose.SERVICE, now)
     (entry,) = payloads(caplog_decision)
     assert entry["outcome"] == "deny"
+    assert entry["decision"] == "deny"
     assert any(r.startswith("no-grant") for r in entry["reasons"])
 
 
@@ -66,6 +69,7 @@ def test_audit_failure_emits_log(store, record, agent, now, caplog_decision):
         gw.access(agent, record, Purpose.SERVICE, now)
     (entry,) = payloads(caplog_decision)
     assert entry["outcome"] == "audit_error"
+    assert entry["decision"] == "allow"  # 失败结局仍可读底层判定
 
 
 def test_masking_failure_emits_log(store, policy, record, agent, now, caplog_decision):
@@ -76,6 +80,7 @@ def test_masking_failure_emits_log(store, policy, record, agent, now, caplog_dec
         gw.access(agent, record, Purpose.SERVICE, now)
     (entry,) = payloads(caplog_decision)
     assert entry["outcome"] == "masking_error"
+    assert entry["decision"] == "allow"
 
 
 def test_logs_contain_no_raw_sensitive_values(store, record, agent, now, caplog_decision):
@@ -118,3 +123,6 @@ def test_concurrent_access_logs_exactly_one_per_decision(store, record, agent, n
     entries = payloads(caplog_decision)
     assert len(entries) == 400
     assert all(e["outcome"] == "allow" for e in entries)
+    assert all(e["decision"] == "allow" for e in entries)
+    ids = [e["log_id"] for e in entries]
+    assert all(ids) and len(set(ids)) == 400  # 每条可辨认、不丢不重

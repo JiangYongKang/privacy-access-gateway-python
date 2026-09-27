@@ -26,7 +26,8 @@ class AccessGateway:
     每次请求只取一次策略快照，保证单次判定内部一致；
     审计写入失败一律不放行；脱敏失败不返回任何字段；
     超期记录的审计引用不输出任何字段，仅返回可复现的引用句柄；
-    每次判定恰好发射一条结构化决策日志，日志不改变放行/拒绝结论。
+    每次判定恰好发射一条结构化决策日志（含独立的判定结论 decision）；
+    日志输出端任何故障都被隔离，不改变放行/拒绝结论与错误归类。
     """
 
     def __init__(
@@ -59,6 +60,8 @@ class AccessGateway:
                 role=subject.role,
                 resource_id=resource.record_id,
                 purpose=purpose.value,
+                # 判定本身的放行/拒绝结论，独立于结局分类与日志端故障
+                decision=result.decision.value,
                 outcome=outcome,
                 policy_version=result.policy_version,
                 reasons=result.reasons,
